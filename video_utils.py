@@ -1,75 +1,65 @@
 import torch
 import torch.nn as nn
+from torchvision import models, transforms
+from facenet_pytorch import MTCNN
 import cv2
 import numpy as np
-from torchvision import models, transforms
-from PIL import Image
-from facenet_pytorch import MTCNN
 
 # -----------------------------
-# DEVICE
+# DEVICE SETUP
 # -----------------------------
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # -----------------------------
-# IMAGE TRANSFORMS
+# CNN FEATURE EXTRACTOR
 # -----------------------------
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225]
-    )
-])
+def build_cnn_feature_extractor():
+    model = models.resnet18(weights=None)   # IMPORTANT: no pre-trained weights for deployment
+    model.fc = nn.Identity()                # Output = 512 features
+    return model
 
 # -----------------------------
 # CNN + LSTM MODEL
 # -----------------------------
 class CNN_LSTM(nn.Module):
-    def __init__(self, hidden_size=256):
+    def __init__(self, hidden_size=256, num_layers=1):
         super(CNN_LSTM, self).__init__()
 
-        base_cnn = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
-        self.cnn = nn.Sequential(*list(base_cnn.children())[:-1])
+        self.cnn = build_cnn_feature_extractor()
 
         self.lstm = nn.LSTM(
             input_size=512,
             hidden_size=hidden_size,
-            num_layers=1,
+            num_layers=num_layers,
             batch_first=True
         )
 
-        self.fc = nn.Linear(hidden_size, 2)
+        self.classifier = nn.Linear(hidden_size, 2)
 
     def forward(self, x):
-        # x: (B, T, C, H, W)
-        B, T, C, H, W = x.size()
-        x = x.view(B * T, C, H, W)
+        # x = (batch, 16, 3, 224, 224)
+        batch, seq, C, H, W = x.shape
 
-        features = self.cnn(x)
-        features = features.view(B, T, -1)
+        x = x.view(batch * seq, C, H, W)
+        features = self.cnn(x)              # → (batch*16, 512)
+        features = features.view(batch, seq, -1)
 
-        lstm_out, _ = self.lstm(features)
-        out = lstm_out[:, -1, :]
-        return self.fc(out)
+        lstm_out, _ = self.lstm(features)   # → (batch, 16, hidden)
+        output = lstm_out[:, -1, :]         # Last timestep
 
+        return self.classifier(output)      # → (batch, 2)
 
 # -----------------------------
-# LOAD MODEL
+# LOAD TRAINED MODEL
 # -----------------------------
 def load_model(model_path="model/deepfake_cnn_lstm.pth"):
     model = CNN_LSTM().to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+
+    state_dict = torch.load(model_path, map_location=device)
+    model.load_state_dict(state_dict)
+
     model.eval()
     return model
-
-
-# -----------------------------
-# FACE DETECTOR (NO TENSORFLOW)
-# -----------------------------
-mtcnn = MTCNN(keep_all=True, device=device)
-
 
 # -----------------------------
 # FRAME SAMPLING
@@ -78,86 +68,59 @@ def sample_frames(video_path, num_frames=16):
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    if total_frames <= 0:
-        cap.release()
+    if total_frames == 0:
         return []
 
-    indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+    frame_ids = np.linspace(0, total_frames - 1, num_frames).astype(int)
     frames = []
 
-    i = 0
-    while True:
+    for fid in frame_ids:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fid)
         ret, frame = cap.read()
-        if not ret:
-            break
-        if i in indices:
+        if ret:
             frames.append(frame)
-        i += 1
 
     cap.release()
     return frames
 
-
 # -----------------------------
-# FACE EXTRACTION
+# FACE EXTRACTION USING MTCNN
 # -----------------------------
-def extract_faces(frames):
-    faces = []
+mtcnn = MTCNN(image_size=224, margin=20, device=device)
 
-    for frame in frames:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        boxes, _ = mtcnn.detect(rgb)
+def extract_face(frame):
+    img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    face = mtcnn(img)
 
-        if boxes is None:
-            continue
-
-        for box in boxes[:1]:  # take first face only
-            x1, y1, x2, y2 = map(int, box)
-            face = rgb[y1:y2, x1:x2]
-
-            if face.size == 0:
-                continue
-
-            face_img = Image.fromarray(face)
-            face_tensor = transform(face_img)
-            faces.append(face_tensor)
-
-    return faces
-
-
-# -----------------------------
-# VIDEO TO TENSOR
-# -----------------------------
-def faces_to_tensor(faces):
-    if len(faces) == 0:
+    if face is None:
         return None
-    faces = torch.stack(faces)
-    faces = faces.unsqueeze(0)  # (1, T, C, H, W)
-    return faces.to(device)
 
+    return face
 
 # -----------------------------
-# MAIN PREDICTION FUNCTION
+# MAIN PREDICT FUNCTION
 # -----------------------------
 def predict_video(video_path):
     model = load_model()
 
-    frames = sample_frames(video_path)
-    if len(frames) == 0:
-        return "Error: Could not read video"
+    frames = sample_frames(video_path, num_frames=16)
 
-    faces = extract_faces(frames)
-    if len(faces) < 3:
+    if len(frames) == 0:
+        return "Error: Could not read frames"
+
+    faces = []
+    for frame in frames:
+        f = extract_face(frame)
+        if f is not None:
+            faces.append(f)
+
+    if len(faces) < 4:
         return "Error: Face not detected clearly"
 
-    input_tensor = faces_to_tensor(faces)
+    faces_tensor = torch.stack(faces).unsqueeze(0).to(device)
 
     with torch.no_grad():
-        output = model(input_tensor)
-        probs = torch.softmax(output, dim=1)
-        pred = torch.argmax(probs, dim=1).item()
+        output = model(faces_tensor)
+        pred = torch.argmax(output, dim=1).item()
 
-    if pred == 0:
-        return f"REAL (Confidence: {probs[0][0]:.2f})"
-    else:
-        return f"FAKE (Confidence: {probs[0][1]:.2f})"
+    return "FAKE" if pred == 1 else "REAL"
