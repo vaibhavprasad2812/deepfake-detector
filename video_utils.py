@@ -1,72 +1,145 @@
-import streamlit as st
-import tempfile
-from video_utils import predict_video
+import cv2
+import torch
+import torch.nn as nn
+import numpy as np
+from torchvision import models, transforms
 
 # -----------------------------
-# PAGE CONFIG
+# DEVICE
 # -----------------------------
-st.set_page_config(
-    page_title="Deepfake Video Detection",
-    page_icon="🎭",
-    layout="wide"
-)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # -----------------------------
-# HEADER
+# CNN FEATURE EXTRACTOR (ResNet18)
 # -----------------------------
-st.markdown(
-    """
-    <h1 style="text-align:center;">🎭 Deepfake Video Detection System</h1>
-    <p style="text-align:center; font-size:18px;">
-    Upload a video and the model will classify it as <b>REAL</b> or <b>FAKE</b>
-    </p>
-    """,
-    unsafe_allow_html=True
-)
+def build_cnn_feature_extractor():
+    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+    model.fc = nn.Identity()
+    return model
 
 # -----------------------------
-# FILE UPLOAD
+# CNN + LSTM MODEL
 # -----------------------------
-uploaded_file = st.file_uploader(
-    "Upload MP4 Video",
-    type=["mp4", "mov", "avi"]
-)
+class CNN_LSTM(nn.Module):
+    def __init__(self, hidden_size=256):
+        super().__init__()
+        self.cnn = build_cnn_feature_extractor()
+        self.lstm = nn.LSTM(
+            input_size=512,
+            hidden_size=hidden_size,
+            batch_first=True
+        )
+        self.classifier = nn.Linear(hidden_size, 2)
 
-if uploaded_file:
-    with tempfile.NamedTemporaryFile(delete=False) as tfile:
-        tfile.write(uploaded_file.read())
+    def forward(self, x):
+        b, t, c, h, w = x.shape
+        x = x.view(b * t, c, h, w)
+        features = self.cnn(x)
+        features = features.view(b, t, -1)
+        lstm_out, _ = self.lstm(features)
+        return self.classifier(lstm_out[:, -1])
 
-    st.video(uploaded_file)
+# -----------------------------
+# LOAD MODEL
+# -----------------------------
+def load_model():
+    model = CNN_LSTM().to(device)
+    model.load_state_dict(
+        torch.load("model/deepfake_cnn_lstm.pth", map_location=device)
+    )
+    model.eval()
+    return model
 
-    if st.button("Analyze Video"):
-        progress = st.progress(0)
-        status = st.empty()
+# -----------------------------
+# TRANSFORMS
+# -----------------------------
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Resize((224, 224)),
+    transforms.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225]
+    )
+])
 
-        status.info("🔍 Extracting frames...")
-        progress.progress(25)
+# -----------------------------
+# FRAME SAMPLING
+# -----------------------------
+def sample_frames(video_path, max_frames=16):
+    cap = cv2.VideoCapture(video_path)
+    frames = []
 
-        status.info("🙂 Detecting faces...")
-        progress.progress(50)
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if total == 0:
+        return frames
 
-        status.info("🧠 Running deep learning model...")
-        result = predict_video(tfile.name)
-        progress.progress(75)
+    step = max(1, total // max_frames)
+    count = 0
 
-        status.info("📊 Finalizing result...")
-        progress.progress(100)
+    while cap.isOpened() and len(frames) < max_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if count % step == 0:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame)
+        count += 1
 
-        st.markdown("---")
+    cap.release()
+    return frames
 
-        # RESULT
-        if result["label"] == "No face detected":
-            st.error("❌ No face detected clearly in the video")
-        else:
-            if result["label"] == "REAL":
-                st.success(f"✅ REAL ({result['confidence']}% confidence)")
-            else:
-                st.error(f"🚨 FAKE ({result['confidence']}% confidence)")
+# -----------------------------
+# SIMPLE FACE EXTRACTION (center crop)
+# -----------------------------
+def extract_faces(frames):
+    faces = []
+    for frame in frames:
+        h, w, _ = frame.shape
+        size = min(h, w)
+        cx, cy = w // 2, h // 2
+        face = frame[
+            cy - size // 4 : cy + size // 4,
+            cx - size // 4 : cx + size // 4
+        ]
+        if face.size != 0:
+            faces.append(face)
+    return faces
 
-            st.markdown("### 👤 Extracted Face Samples")
-            cols = st.columns(4)
-            for i, face in enumerate(result["faces"][:4]):
-                cols[i].image(face, use_container_width=True)
+# -----------------------------
+# FACE → TENSOR
+# -----------------------------
+def faces_to_tensor(faces):
+    tensors = [transform(face) for face in faces]
+    return torch.stack(tensors)
+
+# -----------------------------
+# MAIN PREDICTION FUNCTION
+# -----------------------------
+def predict_video(video_path):
+    model = load_model()
+
+    frames = sample_frames(video_path)
+    faces = extract_faces(frames)
+
+    if len(faces) == 0:
+        return {
+            "label": "No face detected",
+            "confidence": 0,
+            "faces": []
+        }
+
+    faces_tensor = faces_to_tensor(faces)
+    faces_tensor = faces_tensor.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        outputs = model(faces_tensor)
+        probs = torch.softmax(outputs, dim=1)
+        confidence, prediction = torch.max(probs, dim=1)
+
+    label = "REAL" if prediction.item() == 0 else "FAKE"
+
+    return {
+        "label": label,
+        "confidence": round(confidence.item() * 100, 2),
+        "faces": faces
+    }

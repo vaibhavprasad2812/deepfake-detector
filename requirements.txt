@@ -1,7 +1,5 @@
 streamlit
 torch
 torchvision
-numpy
 opencv-python-headless
-facenet-pytorch
-Pillow
+numpy
